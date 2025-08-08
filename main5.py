@@ -1,10 +1,10 @@
 # main.py
-# Final version adapted for HackRx 6.0 submission requirements.
-# This script runs a FastAPI server with the required /hackrx/run endpoint.
-# For each request, it dynamically downloads a PDF from a URL, processes it in memory,
-# and answers a list of questions based on its content.
+# Memory-optimized version for HackRx 6.0 submission
+# Implements aggressive memory management and streaming processing
 
 import os
+import gc
+import tempfile
 import fitz  # PyMuPDF
 import requests
 from fastapi import FastAPI, HTTPException, Security
@@ -19,15 +19,28 @@ from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
+import psutil
+import logging
 
-# Load environment variables from .env file
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
 load_dotenv()
 
 # --- Configuration & Security ---
 HACKATHON_API_KEY = os.getenv("HACKATHON_API_KEY", "29ac380920ae0807a02894db4f79b819b20a6410ba3fcebd7adf0a924a01eae3")
 security = HTTPBearer()
 
-# --- Pydantic Models for API ---
+# Memory monitoring
+def log_memory_usage(operation: str):
+    """Log current memory usage"""
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    logger.info(f"{operation}: Memory usage: {memory_mb:.1f}MB")
+
+# --- Pydantic Models ---
 class HackathonRequest(BaseModel):
     documents: HttpUrl
     questions: list[str]
@@ -35,113 +48,241 @@ class HackathonRequest(BaseModel):
 class HackathonResponse(BaseModel):
     answers: list[str]
 
-# --- FastAPI App Initialization ---
+# --- FastAPI App ---
 app = FastAPI(
-    title="HackRx 6.0 Intelligent Query-Retrieval System",
-    description="Processes a document from a URL and answers questions based on its content.",
-    version="2.0.6" # Final memory optimization
+    title="HackRx 6.0 Memory-Optimized System",
+    description="Memory-efficient document processing and Q&A system.",
+    version="3.0.0"
 )
 
-# --- Global Components (Loaded once on startup) ---
-# PERFORMANCE OPTIMIZATION: Using a smaller, more memory-efficient model loaded at startup.
-print("Loading embedding model...")
-try:
-    embeddings = HuggingFaceEmbeddings(model_name="paraphrase-MiniLM-L3-v2")
-    print("Embedding model loaded successfully.")
-except Exception as e:
-    print(f"Error loading embedding model: {e}")
-    embeddings = None
+# --- Lazy Loading Components ---
+_embeddings = None
+_llm = None
 
-print("Initializing Groq LLM...")
-llm = ChatGroq(
-    model_name="llama3-8b-8192", # Using a smaller, faster LLM
-    temperature=0,
-    api_key=os.getenv("GROQ_API_KEY")
-)
-print("Groq LLM initialized.")
+def get_embeddings():
+    """Lazy load embeddings model"""
+    global _embeddings
+    if _embeddings is None:
+        logger.info("Loading embedding model...")
+        try:
+            # Use an even smaller model for better memory efficiency
+            _embeddings = HuggingFaceEmbeddings(
+                model_name="all-MiniLM-L6-v2",  # Smaller than paraphrase-MiniLM-L3-v2
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            log_memory_usage("Embeddings loaded")
+        except Exception as e:
+            logger.error(f"Error loading embedding model: {e}")
+            raise HTTPException(status_code=500, detail="Failed to load embedding model")
+    return _embeddings
 
-# --- Prompt Engineering ---
-qa_prompt_template = """
-You are an expert AI assistant. Answer the user's question based *only* on the provided 'Relevant Clauses'.
-If the answer is not in the context, state that clearly. Be concise.
+def get_llm():
+    """Lazy load LLM"""
+    global _llm
+    if _llm is None:
+        logger.info("Initializing Groq LLM...")
+        _llm = ChatGroq(
+            model_name="llama3-8b-8192",
+            temperature=0,
+            api_key=os.getenv("GROQ_API_KEY"),
+            max_tokens=512  # Limit response length
+        )
+        log_memory_usage("LLM initialized")
+    return _llm
 
-**Relevant Clauses:**
----
-{context}
----
+# --- Optimized Prompt ---
+qa_prompt_template = """Answer based only on the context. Be concise.
 
-**Question:**
-{question}
+Context: {context}
 
-**Answer:**
-"""
+Question: {question}
+
+Answer:"""
+
 QA_PROMPT = PromptTemplate.from_template(qa_prompt_template)
 
-# --- Helper Functions for Dynamic Processing ---
-def process_document_from_url(url: str):
-    """Downloads a PDF from a URL, extracts text, chunks it, and creates a vector store."""
-    if not embeddings:
-        raise HTTPException(status_code=500, detail="Embedding model is not available.")
+# --- Memory-Optimized Document Processing ---
+def process_document_stream(url: str, max_pages: int = 20):
+    """Process document with aggressive memory management"""
+    log_memory_usage("Starting document processing")
+    
     try:
-        response = requests.get(url, timeout=30)
+        # Stream download with size limit
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
-        pdf_bytes = response.content
-
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
-        # OPTIMIZATION: Process text page by page to reduce peak memory usage
-        all_chunks = []
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-        for page_num, page in enumerate(doc):
-            page_text = page.get_text()
-            if page_text:
-                chunks = text_splitter.create_documents([page_text], metadatas=[{"source": f"page_{page_num+1}"}])
-                all_chunks.extend(chunks)
-
-        if not all_chunks:
-            raise HTTPException(status_code=400, detail="Could not extract any text from the document.")
-
-        vector_store = Chroma.from_documents(documents=all_chunks, embedding=embeddings)
-        return vector_store.as_retriever(search_kwargs={"k": 3})
-
+        # Use temporary file to avoid keeping full PDF in memory
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            size = 0
+            max_size = 50 * 1024 * 1024  # 50MB limit
+            
+            for chunk in response.iter_content(chunk_size=8192):
+                size += len(chunk)
+                if size > max_size:
+                    raise HTTPException(status_code=400, detail="Document too large (>50MB)")
+                tmp_file.write(chunk)
+            
+            tmp_file.flush()
+            log_memory_usage("Document downloaded")
+            
+            # Process PDF with memory management
+            doc = fitz.open(tmp_file.name)
+            
+            # Limit pages processed
+            total_pages = min(len(doc), max_pages)
+            logger.info(f"Processing {total_pages} pages (limited from {len(doc)})")
+            
+            # Process in smaller batches
+            all_text_chunks = []
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,  # Smaller chunks
+                chunk_overlap=50,
+                length_function=len
+            )
+            
+            batch_size = 5  # Process 5 pages at a time
+            for start_page in range(0, total_pages, batch_size):
+                end_page = min(start_page + batch_size, total_pages)
+                batch_text = ""
+                
+                # Extract text from batch of pages
+                for page_num in range(start_page, end_page):
+                    page = doc[page_num]
+                    page_text = page.get_text()
+                    if page_text.strip():
+                        batch_text += f"\n--- Page {page_num + 1} ---\n{page_text}"
+                    
+                    # Clear page from memory
+                    del page_text
+                
+                # Split batch text into chunks
+                if batch_text.strip():
+                    batch_chunks = text_splitter.split_text(batch_text)
+                    all_text_chunks.extend(batch_chunks)
+                
+                # Clear batch text
+                del batch_text
+                gc.collect()
+            
+            doc.close()
+            
+            # Clean up temp file
+            os.unlink(tmp_file.name)
+            
+            log_memory_usage(f"Text extracted: {len(all_text_chunks)} chunks")
+            
+            if not all_text_chunks:
+                raise HTTPException(status_code=400, detail="No text extracted from document")
+            
+            # Limit number of chunks to manage memory
+            max_chunks = 100
+            if len(all_text_chunks) > max_chunks:
+                all_text_chunks = all_text_chunks[:max_chunks]
+                logger.info(f"Limited to {max_chunks} chunks for memory management")
+            
+            # Create documents
+            documents = [Document(page_content=chunk) for chunk in all_text_chunks]
+            del all_text_chunks
+            gc.collect()
+            
+            # Create vector store with memory management
+            embeddings = get_embeddings()
+            vector_store = Chroma.from_documents(
+                documents=documents,
+                embedding=embeddings,
+                persist_directory=None  # Keep in memory, don't persist
+            )
+            
+            del documents
+            gc.collect()
+            log_memory_usage("Vector store created")
+            
+            return vector_store.as_retriever(search_kwargs={"k": 2})  # Reduced k for memory
+            
     except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
+        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)[:100]}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+        logger.error(f"Document processing error: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)[:100]}")
 
-# --- Security Dependency ---
+# --- Security ---
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    """Verifies the Bearer token against the required hackathon key."""
     if credentials.scheme != "Bearer" or credentials.credentials != HACKATHON_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+        raise HTTPException(status_code=403, detail="Invalid API key")
     return credentials.credentials
 
-# --- API Endpoint Definitions ---
+# --- Optimized Endpoint ---
 @app.post("/hackrx/run", response_model=HackathonResponse, tags=["Hackathon"])
 async def run_submission(request: HackathonRequest, token: str = Security(verify_token)):
-    """
-    This endpoint receives a document URL and a list of questions.
-    It processes the document on-the-fly and returns a list of answers.
-    """
-    print(f"Processing request for document: {request.documents}")
+    """Memory-optimized document Q&A endpoint"""
+    log_memory_usage("Request started")
     
-    retriever = process_document_from_url(str(request.documents))
+    try:
+        # Process document
+        retriever = process_document_stream(str(request.documents))
+        
+        # Get LLM
+        llm = get_llm()
+        
+        # Create RAG chain
+        rag_chain = (
+            {"context": retriever, "question": RunnablePassthrough()}
+            | QA_PROMPT
+            | llm
+            | StrOutputParser()
+        )
+        
+        # Process questions with memory management
+        answers = []
+        max_questions = min(len(request.questions), 10)  # Limit questions
+        
+        for i, question in enumerate(request.questions[:max_questions]):
+            try:
+                logger.info(f"Processing question {i+1}/{max_questions}")
+                answer = rag_chain.invoke(question[:500])  # Limit question length
+                answers.append(answer)
+                
+                # Force garbage collection between questions
+                if i % 2 == 1:
+                    gc.collect()
+                    log_memory_usage(f"After question {i+1}")
+                    
+            except Exception as e:
+                logger.error(f"Question {i+1} error: {e}")
+                answers.append(f"Error: {str(e)[:100]}")
+        
+        # Clean up
+        del retriever, rag_chain
+        gc.collect()
+        log_memory_usage("Request completed")
+        
+        return {"answers": answers}
+        
+    except Exception as e:
+        logger.error(f"Request failed: {e}")
+        # Force cleanup on error
+        gc.collect()
+        raise
 
-    rag_chain = (
-        {"context": retriever, "question": RunnablePassthrough()}
-        | QA_PROMPT
-        | llm
-        | StrOutputParser()
-    )
+# --- Health Check ---
+@app.get("/health")
+async def health_check():
+    """Health check with memory info"""
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    return {
+        "status": "healthy",
+        "memory_usage_mb": round(memory_mb, 1),
+        "memory_limit_mb": 512
+    }
 
-    answers = []
-    print(f"Answering {len(request.questions)} questions...")
-    for question in request.questions:
-        try:
-            answer = rag_chain.invoke(question)
-            answers.append(answer)
-        except Exception as e:
-            answers.append(f"Error processing question: {e}")
-    
-    print("Finished answering all questions.")
-    return {"answers": answers}
+# --- Startup Event ---
+@app.on_event("startup")
+async def startup_event():
+    """Log startup memory usage"""
+    log_memory_usage("Application startup")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
