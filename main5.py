@@ -210,6 +210,20 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
     return credentials.credentials
 
 # --- Optimized Endpoint ---
+@app.get("/hackrx/run", tags=["Hackathon"])
+async def get_endpoint_info():
+    """GET endpoint info - actual endpoint requires POST"""
+    return {
+        "message": "This endpoint requires POST method",
+        "method": "POST",
+        "content_type": "application/json",
+        "required_fields": {
+            "documents": "URL of the PDF document",
+            "questions": "List of questions to answer"
+        },
+        "auth": "Bearer token required"
+    }
+
 @app.post("/hackrx/run", response_model=HackathonResponse, tags=["Hackathon"])
 async def run_submission(request: HackathonRequest, token: str = Security(verify_token)):
     """Memory-optimized document Q&A endpoint"""
@@ -262,7 +276,19 @@ async def run_submission(request: HackathonRequest, token: str = Security(verify
         gc.collect()
         raise
 
-# --- Health Check ---
+# --- Health Check & Root Endpoints ---
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "HackRx 6.0 Q&A System",
+        "status": "running",
+        "endpoints": {
+            "main": "POST /hackrx/run",
+            "health": "GET /health"
+        }
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
