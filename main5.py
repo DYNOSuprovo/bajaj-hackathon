@@ -1,6 +1,11 @@
 # main.py
+# Final version adapted for HackRx 6.0 submission requirements.
+# This script runs a FastAPI server with the required /hackrx/run endpoint.
+# For each request, it dynamically downloads a PDF from a URL, processes it in memory,
+# and answers a list of questions based on its content.
+
 import os
-import fitz 
+import fitz  # PyMuPDF
 import requests
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -15,11 +20,14 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from dotenv import load_dotenv
 
+# Load environment variables from .env file
 load_dotenv()
 
+# --- Configuration & Security ---
 HACKATHON_API_KEY = os.getenv("HACKATHON_API_KEY", "29ac380920ae0807a02894db4f79b819b20a6410ba3fcebd7adf0a924a01eae3")
 security = HTTPBearer()
 
+# --- Pydantic Models for API ---
 class HackathonRequest(BaseModel):
     documents: HttpUrl
     questions: list[str]
@@ -27,16 +35,16 @@ class HackathonRequest(BaseModel):
 class HackathonResponse(BaseModel):
     answers: list[str]
 
+# --- FastAPI App Initialization ---
 app = FastAPI(
     title="HackRx 6.0 Intelligent Query-Retrieval System",
     description="Processes a document from a URL and answers questions based on its content.",
-    version="2.0.1" # Updated version
+    version="2.0.2" # Updated version for memory optimization
 )
 
-print("Loading embedding model...")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-print("Embedding model loaded.")
-
+# --- Global Components (Loaded once on startup) ---
+# MEMORY OPTIMIZATION: We no longer load the embedding model here at startup.
+# It will be loaded on-demand within the request processing function.
 print("Initializing Groq LLM...")
 llm = ChatGroq(
     model_name="llama3-70b-8192",
@@ -45,6 +53,7 @@ llm = ChatGroq(
 )
 print("Groq LLM initialized.")
 
+# --- Prompt Engineering ---
 qa_prompt_template = """
 You are an expert AI assistant for answering questions based on a provided document.
 Your task is to answer the user's question accurately and concisely, using *only* the information from the 'Relevant Clauses'.
@@ -61,18 +70,37 @@ Do not use any external knowledge. If the answer is not found in the provided co
 **Answer:**
 """
 QA_PROMPT = PromptTemplate.from_template(qa_prompt_template)
+
+# --- Helper Functions for Dynamic Processing ---
 def process_document_from_url(url: str):
     """Downloads a PDF from a URL, extracts text, chunks it, and creates a vector store."""
     try:
+        # MEMORY OPTIMIZATION: Load the embedding model here, inside the function.
+        # This increases response time but keeps startup memory low.
+        print("Loading embedding model for request...")
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        print("Embedding model loaded.")
+
+        # 1. Download PDF from URL
         response = requests.get(url)
         response.raise_for_status()
         pdf_bytes = response.content
+
+        # 2. Extract text using PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         text = "".join(page.get_text() for page in doc)
+        
+        # 3. Chunk the text
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks = text_splitter.split_text(text)
+        
+        # 4. Create LangChain Document objects
         documents = [Document(page_content=chunk) for chunk in chunks]
+        
+        # 5. Create an in-memory vector store
+        print("Creating in-memory vector store...")
         vector_store = Chroma.from_documents(documents=documents, embedding=embeddings)
+        print("Vector store created.")
         return vector_store.as_retriever(search_kwargs={"k": 5})
 
     except requests.RequestException as e:
@@ -95,13 +123,16 @@ async def run_submission(request: HackathonRequest, token: str = Security(verify
     It processes the document on-the-fly and returns a list of answers.
     """
     print(f"Processing request for document: {request.documents}")
+    
     retriever = process_document_from_url(str(request.documents))
+
     rag_chain = (
         {"context": retriever, "question": RunnablePassthrough()}
         | QA_PROMPT
         | llm
         | StrOutputParser()
     )
+
     answers = []
     print(f"Answering {len(request.questions)} questions...")
     for question in request.questions:
@@ -113,4 +144,3 @@ async def run_submission(request: HackathonRequest, token: str = Security(verify
     
     print("Finished answering all questions.")
     return {"answers": answers}
-
