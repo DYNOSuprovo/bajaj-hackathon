@@ -1,6 +1,8 @@
 # main.py
 # Final version adapted for HackRx 6.0 submission requirements.
-# Includes GET handling to avoid 405 errors.
+# This script runs a FastAPI server with the required /hackrx/run endpoint.
+# For each request, it dynamically downloads a PDF from a URL, processes it in memory,
+# and answers a list of questions based on its content.
 
 import os
 import fitz  # PyMuPDF
@@ -37,13 +39,22 @@ class HackathonResponse(BaseModel):
 app = FastAPI(
     title="HackRx 6.0 Intelligent Query-Retrieval System",
     description="Processes a document from a URL and answers questions based on its content.",
-    version="2.0.2"
+    version="2.0.6" # Final memory optimization
 )
 
-# --- Global Components ---
+# --- Global Components (Loaded once on startup) ---
+# PERFORMANCE OPTIMIZATION: Using a smaller, memory-efficient model loaded at startup.
+print("Loading embedding model...")
+try:
+    embeddings = HuggingFaceEmbeddings(model_name="paraphrase-MiniLM-L3-v2")
+    print("Embedding model loaded successfully.")
+except Exception as e:
+    print(f"Error loading embedding model: {e}")
+    embeddings = None
+
 print("Initializing Groq LLM...")
 llm = ChatGroq(
-    model_name="llama3-70b-8192",
+    model_name="llama3-8b-8192", # Using a smaller, faster LLM
     temperature=0,
     api_key=os.getenv("GROQ_API_KEY")
 )
@@ -51,9 +62,8 @@ print("Groq LLM initialized.")
 
 # --- Prompt Engineering ---
 qa_prompt_template = """
-You are an expert AI assistant for answering questions based on a provided document.
-Your task is to answer the user's question accurately and concisely, using *only* the information from the 'Relevant Clauses'.
-Do not use any external knowledge. If the answer is not found in the provided context, state that clearly.
+You are an expert AI assistant. Answer the user's question based *only* on the provided 'Relevant Clauses'.
+If the answer is not in the context, state that clearly. Be concise.
 
 **Relevant Clauses:**
 ---
@@ -67,30 +77,32 @@ Do not use any external knowledge. If the answer is not found in the provided co
 """
 QA_PROMPT = PromptTemplate.from_template(qa_prompt_template)
 
-# --- Helper Functions ---
+# --- Helper Functions for Dynamic Processing ---
 def process_document_from_url(url: str):
     """Downloads a PDF from a URL, extracts text, chunks it, and creates a vector store."""
+    if not embeddings:
+        raise HTTPException(status_code=500, detail="Embedding model is not available.")
     try:
-        print("Loading embedding model for request...")
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        print("Embedding model loaded.")
-
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
         pdf_bytes = response.content
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text = "".join(page.get_text() for page in doc)
+        
+        # OPTIMIZATION: Process text page by page to reduce peak memory usage
+        all_chunks = []
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+        for page_num, page in enumerate(doc):
+            page_text = page.get_text()
+            if page_text:
+                chunks = text_splitter.create_documents([page_text], metadatas=[{"source": f"page_{page_num+1}"}])
+                all_chunks.extend(chunks)
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
-        chunks = text_splitter.split_text(text)
+        if not all_chunks:
+            raise HTTPException(status_code=400, detail="Could not extract any text from the document.")
 
-        documents = [Document(page_content=chunk) for chunk in chunks]
-
-        print("Creating in-memory vector store...")
-        vector_store = Chroma.from_documents(documents=documents, embedding=embeddings)
-        print("Vector store created.")
-        return vector_store.as_retriever(search_kwargs={"k": 5})
+        vector_store = Chroma.from_documents(documents=all_chunks, embedding=embeddings)
+        return vector_store.as_retriever(search_kwargs={"k": 3})
 
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
@@ -99,14 +111,20 @@ def process_document_from_url(url: str):
 
 # --- Security Dependency ---
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """Verifies the Bearer token against the required hackathon key."""
     if credentials.scheme != "Bearer" or credentials.credentials != HACKATHON_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
     return credentials.credentials
 
-# --- POST Endpoint for HackRx ---
-@app.post("/hackrx/run", response_model=HackathonResponse)
+# --- API Endpoint Definitions ---
+@app.post("/hackrx/run", response_model=HackathonResponse, tags=["Hackathon"])
 async def run_submission(request: HackathonRequest, token: str = Security(verify_token)):
+    """
+    This endpoint receives a document URL and a list of questions.
+    It processes the document on-the-fly and returns a list of answers.
+    """
     print(f"Processing request for document: {request.documents}")
+    
     retriever = process_document_from_url(str(request.documents))
 
     rag_chain = (
@@ -124,22 +142,6 @@ async def run_submission(request: HackathonRequest, token: str = Security(verify
             answers.append(answer)
         except Exception as e:
             answers.append(f"Error processing question: {e}")
-
+    
     print("Finished answering all questions.")
     return {"answers": answers}
-
-# --- GET Handler to Avoid 405 Errors ---
-@app.get("/hackrx/run")
-async def get_info():
-    return {
-        "message": "This endpoint only supports POST requests for PDF processing. Use POST with authentication."
-    }
-
-# --- Root and Health Check Endpoints ---
-@app.get("/")
-def root():
-    return {"status": "running"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
