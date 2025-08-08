@@ -1,8 +1,6 @@
 # main.py
 # Final version adapted for HackRx 6.0 submission requirements.
-# This script runs a FastAPI server with the required /hackrx/run endpoint.
-# For each request, it dynamically downloads a PDF from a URL, processes it in memory,
-# and answers a list of questions based on its content.
+# Includes GET handling to avoid 405 errors.
 
 import os
 import fitz  # PyMuPDF
@@ -39,12 +37,10 @@ class HackathonResponse(BaseModel):
 app = FastAPI(
     title="HackRx 6.0 Intelligent Query-Retrieval System",
     description="Processes a document from a URL and answers questions based on its content.",
-    version="2.0.2" # Updated version for memory optimization
+    version="2.0.2"
 )
 
-# --- Global Components (Loaded once on startup) ---
-# MEMORY OPTIMIZATION: We no longer load the embedding model here at startup.
-# It will be loaded on-demand within the request processing function.
+# --- Global Components ---
 print("Initializing Groq LLM...")
 llm = ChatGroq(
     model_name="llama3-70b-8192",
@@ -71,33 +67,26 @@ Do not use any external knowledge. If the answer is not found in the provided co
 """
 QA_PROMPT = PromptTemplate.from_template(qa_prompt_template)
 
-# --- Helper Functions for Dynamic Processing ---
+# --- Helper Functions ---
 def process_document_from_url(url: str):
     """Downloads a PDF from a URL, extracts text, chunks it, and creates a vector store."""
     try:
-        # MEMORY OPTIMIZATION: Load the embedding model here, inside the function.
-        # This increases response time but keeps startup memory low.
         print("Loading embedding model for request...")
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         print("Embedding model loaded.")
 
-        # 1. Download PDF from URL
         response = requests.get(url)
         response.raise_for_status()
         pdf_bytes = response.content
 
-        # 2. Extract text using PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         text = "".join(page.get_text() for page in doc)
-        
-        # 3. Chunk the text
+
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks = text_splitter.split_text(text)
-        
-        # 4. Create LangChain Document objects
+
         documents = [Document(page_content=chunk) for chunk in chunks]
-        
-        # 5. Create an in-memory vector store
+
         print("Creating in-memory vector store...")
         vector_store = Chroma.from_documents(documents=documents, embedding=embeddings)
         print("Vector store created.")
@@ -110,20 +99,14 @@ def process_document_from_url(url: str):
 
 # --- Security Dependency ---
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    """Verifies the Bearer token against the required hackathon key."""
     if credentials.scheme != "Bearer" or credentials.credentials != HACKATHON_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
     return credentials.credentials
 
-# --- Main API Endpoint ---
+# --- POST Endpoint for HackRx ---
 @app.post("/hackrx/run", response_model=HackathonResponse)
 async def run_submission(request: HackathonRequest, token: str = Security(verify_token)):
-    """
-    This endpoint receives a document URL and a list of questions.
-    It processes the document on-the-fly and returns a list of answers.
-    """
     print(f"Processing request for document: {request.documents}")
-    
     retriever = process_document_from_url(str(request.documents))
 
     rag_chain = (
@@ -141,6 +124,22 @@ async def run_submission(request: HackathonRequest, token: str = Security(verify
             answers.append(answer)
         except Exception as e:
             answers.append(f"Error processing question: {e}")
-    
+
     print("Finished answering all questions.")
     return {"answers": answers}
+
+# --- GET Handler to Avoid 405 Errors ---
+@app.get("/hackrx/run")
+async def get_info():
+    return {
+        "message": "This endpoint only supports POST requests for PDF processing. Use POST with authentication."
+    }
+
+# --- Root and Health Check Endpoints ---
+@app.get("/")
+def root():
+    return {"status": "running"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
