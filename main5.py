@@ -43,7 +43,7 @@ app = FastAPI(
 )
 
 # --- Global Components (Loaded once on startup) ---
-# PERFORMANCE OPTIMIZATION: Using a smaller, memory-efficient model loaded at startup.
+# PERFORMANCE OPTIMIZATION: Using a smaller, more memory-efficient model loaded at startup.
 print("Loading embedding model...")
 try:
     embeddings = HuggingFaceEmbeddings(model_name="paraphrase-MiniLM-L3-v2")
