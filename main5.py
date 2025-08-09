@@ -29,7 +29,8 @@ load_dotenv()
 HACKATHON_API_KEY = os.getenv("HACKATHON_API_KEY", "29ac380920ae0807a02894db4f79b819b20a6410ba3fcebd7adf0a924a01eae3")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN") # <-- ACTION REQUIRED: Add this to your Render environment variables
-EMBEDDING_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+# CORRECTED URL: Removed the incorrect '/pipeline/feature-extraction' path.
+EMBEDDING_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
 
 security = HTTPBearer()
 
@@ -45,7 +46,7 @@ class HackathonResponse(BaseModel):
 app = FastAPI(
     title="HackRx 6.0 Memory-Optimized System",
     description="A memory-efficient document processing and Q&A system designed to run on resource-constrained environments.",
-    version="4.0.0"
+    version="4.0.1"
 )
 
 # --- Lazy Loading for LLM ---
